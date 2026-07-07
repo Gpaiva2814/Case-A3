@@ -1,3 +1,4 @@
+import ast
 import re
 
 import nltk
@@ -22,6 +23,20 @@ def clean_text(text):
     return " ".join(tokens)
 
 
+def normalize_list_column(x):
+
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        try:
+            parsed = ast.literal_eval(x)
+            if isinstance(parsed, list):
+                return parsed
+        except:
+            pass
+    return []
+
+
 if __name__ == "__main__":
     books = pl.read_csv(f"{data_dir}/books_data.csv")
 
@@ -39,6 +54,16 @@ if __name__ == "__main__":
         .map_elements(clean_text, return_dtype=pl.Utf8)
         .alias("clean_summary")
     )
-
-    df.write_csv(f"{data_dir}/cleaned_reviews.csv")
-    (df.head()).write_csv(f"{data_dir}/sample_cleaned_reviews.csv")
+    df = df.with_columns(
+        pl.col("authors").map_elements(
+            normalize_list_column, return_dtype=pl.List(pl.Utf8)
+        )
+    )
+    df = df.with_columns(
+        pl.col("categories").map_elements(
+            normalize_list_column, return_dtype=pl.List(pl.Utf8)
+        )
+    )
+    # df.write_csv(f"{data_dir}/cleaned_reviews.csv")
+    df.write_parquet(f"{data_dir}/cleaned_reviews.parquet")
+    # (df.head()).write_csv(f"{data_dir}/sample_cleaned_reviews.csv")
