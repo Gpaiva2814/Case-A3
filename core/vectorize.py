@@ -121,7 +121,7 @@ def create_vector_database(df: pl.DataFrame):
 # ==========================
 
 if __name__ == "__main__":
-    df = pl.read_csv("data/cleaned_reviews.csv")
+    df = pl.read_parquet("data/cleaned_reviews_mapped.parquet")
 
     print(f"Documentos carregados: {df.height}")
 

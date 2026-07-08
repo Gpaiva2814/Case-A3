@@ -26,22 +26,22 @@ def load_data():
 
     # converter strings de listas
     df = df.with_columns(
-        pl.col("authors").map_elements(
+        pl.col("clean_authors").map_elements(
             lambda x: ast.literal_eval(x) if isinstance(x, str) else x,
             return_dtype=pl.List(pl.Utf8),
         )
     )
 
     df = df.with_columns(
-        pl.col("categories").map_elements(
+        pl.col("categories_clean").map_elements(
             lambda x: ast.literal_eval(x) if isinstance(x, str) else x,
             return_dtype=pl.List(pl.Utf8),
         )
     )
 
     # dataframes normalizados
-    df_authors = df.explode("authors")
-    df_categories = df.explode("categories")
+    df_authors = df.explode("clean_authors")
+    df_categories = df.explode("categories_clean")
 
     return df, df_authors, df_categories
 
@@ -57,10 +57,10 @@ st.sidebar.header("Filtros")
 
 
 all_categories = (
-    df_categories.select("categories")
+    df_categories.select("categories_clean")
     .drop_nulls()
     .unique()
-    .sort("categories")["categories"]
+    .sort("categories_clean")["categories_clean"]
     .to_list()
 )
 
@@ -76,10 +76,10 @@ categories = st.sidebar.multiselect(
 
 
 all_authors = (
-    df_authors.select("authors")
+    df_authors.select("clean_authors")
     .drop_nulls()
     .unique()
-    .sort("authors")["authors"]
+    .sort("clean_authors")["clean_authors"]
     .to_list()
 )
 
@@ -101,24 +101,28 @@ filtered_categories = df_categories
 
 if categories:
     filtered_categories = filtered_categories.filter(
-        pl.col("categories").is_in(categories)
+        pl.col("categories_clean").is_in(categories)
     )
 
     filtered_raw = filtered_raw.filter(
-        pl.col("categories").list.eval(pl.element().is_in(categories)).list.any()
+        pl.col("categories_clean").list.eval(pl.element().is_in(categories)).list.any()
     )
 
-    filtered_authors = filtered_authors.filter(pl.col("categories").is_in(categories))
+    filtered_authors = filtered_authors.filter(
+        pl.col("categories_clean").is_in(categories)
+    )
 
 
 if authors:
-    filtered_authors = filtered_authors.filter(pl.col("authors").is_in(authors))
+    filtered_authors = filtered_authors.filter(pl.col("clean_authors").is_in(authors))
 
     filtered_raw = filtered_raw.filter(
-        pl.col("authors").list.eval(pl.element().is_in(authors)).list.any()
+        pl.col("clean_authors").list.eval(pl.element().is_in(authors)).list.any()
     )
 
-    filtered_categories = filtered_categories.filter(pl.col("authors").is_in(authors))
+    filtered_categories = filtered_categories.filter(
+        pl.col("clean_authors").is_in(authors)
+    )
 
 
 # =========================
@@ -244,7 +248,7 @@ st.subheader("🏆 Ranking de autores")
 
 
 author_rank = (
-    filtered_authors.group_by("authors")
+    filtered_authors.group_by("clean_authors")
     .agg(
         [
             pl.col("score").mean().alias("score_mean"),
@@ -261,7 +265,7 @@ author_rank = (
 fig = px.bar(
     author_rank,
     x="score_mean",
-    y="authors",
+    y="clean_authors",
     orientation="h",
     title="Top autores",
 )
