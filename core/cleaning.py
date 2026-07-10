@@ -107,4 +107,17 @@ if __name__ == "__main__":
         ]
     )
 
+    # =========================================================================================
+    # TRATATIVA DE METADADOS AUSENTES (CONTROLE DE QUALIDADE)
+    # Nota Metodológica: Testes de cruzamento interno via Pandas confirmaram que os registros
+    # com autores 'unknown' não possuem duplicatas preenchidas por correspondência de 'Title'.
+    # Tratam-se de lacunas estritas na origem.
+    # Optou-se pelo descarte analítico dessas linhas, dado que representam produtos de cauda longa
+    # (long tail) com baixa relevância amostral e volumetria dispersa, limpando o escopo do modelo.
+    # =========================================================================================
+    df = df.filter(
+        ~pl.col("clean_authors").list.contains("unknown")
+        & (pl.col("clean_authors").list.len() > 0)
+    )
+
     df.sink_parquet(f"{data_dir}/cleaned_reviews.parquet")
