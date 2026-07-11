@@ -61,7 +61,7 @@ def map_score(score):
         return None
 
 
-def process_file():
+def main():
     global model_emb, label_embeddings
 
     print("🧠 Carregando modelo semântico leve para CPU...")
@@ -222,4 +222,4 @@ def process_file():
 
 
 if __name__ == "__main__":
-    process_file()
+    main()

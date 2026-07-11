@@ -82,7 +82,7 @@ def normalize_author(name):
     return name.strip()
 
 
-if __name__ == "__main__":
+def main():
     books = pl.scan_csv(f"{data_dir}/books_data.csv", ignore_errors=True)
     reviews = pl.scan_csv(f"{data_dir}/Books_rating.csv", ignore_errors=True)
 
@@ -153,3 +153,8 @@ if __name__ == "__main__":
     )
 
     df.sink_parquet(f"{data_dir}/cleaned_reviews.parquet")
+    print(f"✅ Base de dados limpa e salva em: {data_dir}/cleaned_reviews.parquet")
+
+
+if __name__ == "__main__":
+    main()
