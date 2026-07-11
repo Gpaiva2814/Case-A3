@@ -1,14 +1,14 @@
 import os
 
+import faiss  # 🔥 Adicionado para o Banco Vetorial
 import nltk
+import numpy as np
 import polars as pl
 from nltk.sentiment import SentimentIntensityAnalyzer
+from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-from transformers import pipeline
 
 nltk.download("vader_lexicon", quiet=True)
-
-# Força o cache do Hugging Face para o diretório local se necessário
 os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
 
 # =========================
@@ -17,29 +17,27 @@ os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
 
 INPUT_PATH = "data/cleaned_reviews_mapped.parquet"
 OUTPUT_PATH = "data/data_sentiment.parquet"
-BATCH_SIZE = 10_000  # 🔥 Reduzido de 50k para 10k para gerenciar o consumo de memória do LLM Zero-Shot
+FAISS_PATH = "vector_db/reviews_index.faiss"
 
 # =========================
 # MODELOS E CONFIG NLP
 # =========================
 
 sia = SentimentIntensityAnalyzer()
+ASPECT_LABELS = [
+    "book plot story development character arc ending narrative twist",
+    "writing style prose editing vocabulary grammar language quality phrasing",
+    "pacing slow fast book speed narrative rhythm dragging reading velocity",
+]
 
-# Inicializa o classificador Zero-Shot (Modelo leve e otimizado para CPU/GPU)
-# Se houver GPU disponível no servidor, mude device=0. Para CPU, use device=-1
-classifier = pipeline(
-    "zero-shot-classification", model="typeform/distilbert-base-uncased-mnli", device=-1
-)
-
-CANDIDATE_LABELS = ["plot", "writing style", "pacing"]
+model_emb = None
+label_embeddings = None
 
 
 def classify_sentiment(text):
     if not isinstance(text, str) or len(text.strip()) == 0:
         return "neutro"
-
     score = sia.polarity_scores(text)["compound"]
-
     if score >= 0.05:
         return "positivo"
     elif score <= -0.05:
@@ -63,105 +61,165 @@ def map_score(score):
         return None
 
 
-def extract_zero_shot_aspects(texts_list):
-    """
-    Executa a classificação Zero-Shot em lote nativo para máxima performance.
-    """
-    if not texts_list:
-        return [], [], []
-
-    # Executa a inferência em batch dentro da biblioteca do Hugging Face
-    outputs = classifier(texts_list, candidate_labels=CANDIDATE_LABELS, batch_size=64)
-
-    plots, styles, pacings = [], [], []
-
-    for out in outputs:
-        # Cria um dicionário temporário mapeando label -> score
-        score_dict = dict(zip(out["labels"], out["scores"]))
-        plots.append(score_dict.get("plot", 0.0))
-        styles.append(score_dict.get("writing style", 0.0))
-        pacings.append(score_dict.get("pacing", 0.0))
-
-    return plots, styles, pacings
-
-
-# =========================
-# PROCESSAMENTO
-# =========================
-
-
 def process_file():
+    global model_emb, label_embeddings
 
-    lf = pl.scan_parquet(INPUT_PATH)
-    total_rows = lf.select(pl.len()).collect().item()
+    print("🧠 Carregando modelo semântico leve para CPU...")
+    model_emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    label_embeddings = model_emb.encode(ASPECT_LABELS, normalize_embeddings=True)
 
-    results = []
+    # 1. Carrega a base completa de forma Lazy
+    lf_original = pl.scan_parquet(INPUT_PATH)
 
-    print(f"Iniciando pipeline de IA para {total_rows} registros...")
-    for start in tqdm(range(0, total_rows, BATCH_SIZE)):
-        df = lf.slice(start, BATCH_SIZE).collect()
+    print("⏳ Coletando e preparando todo o subset de cálculo de uma só vez...")
+    df_calculo = (
+        lf_original.filter(
+            (pl.col("User_id") != "Unknown") & (pl.col("ratingsCount") >= 30)
+        )
+        .select(["Id", "User_id", "text", "clean_summary", "clean_text"])
+        .collect()
+    )
 
-        # 1. Limpeza básica e Métricas de Eloquência calculadas de forma NATALINA no Polars
-        df = df.with_columns(
-            [
-                pl.col("clean_summary")
-                .fill_null("")
-                .str.to_lowercase()
-                .str.strip_chars(),
-                pl.col("text").fill_null("").cast(pl.Utf8),
-                pl.col("clean_text").str.split(" ").list.len().alias("review_length"),
-                pl.col("clean_text")
-                .str.split(" ")
-                .list.unique()
-                .list.len()
-                .alias("unique_words"),
-            ]
+    total_rows = df_calculo.height
+    print(f"📊 Total de registros qualificados para processamento: {total_rows}")
+
+    # 2. Métricas de Eloquência nativas
+    df_calculo = df_calculo.with_columns(
+        [
+            pl.col("text").fill_null("").cast(pl.Utf8),
+            pl.col("clean_summary").fill_null("").str.to_lowercase(),
+            pl.col("clean_text").str.split(" ").list.len().alias("review_length"),
+            pl.col("clean_text")
+            .str.split(" ")
+            .list.unique()
+            .list.len()
+            .alias("unique_words"),
+        ]
+    )
+
+    # 3. INICIALIZA O POOL PARALELO
+    print("🚀 Inicializando Pool de multiprocessamento paralelo...")
+    pool = model_emb.start_multi_process_pool()
+
+    print("🤖 Executando inferência semântica paralela com TQDM...")
+    texts_to_vectorize = df_calculo["text"].to_list()
+
+    # Tamanho do bloco para atualizar a barra de progresso (100k em 100k)
+    CHUNK_SIZE = 100_000
+    all_embeddings = []
+
+    # O loop percorre a lista em pedaços e o tqdm calcula a velocidade e o tempo restante (ETA)
+    for i in tqdm(range(0, total_rows, CHUNK_SIZE), desc="Vetorizando Reviews"):
+        chunk_texts = texts_to_vectorize[i : i + CHUNK_SIZE]
+        truncated_texts = [str(t)[:140] if t else "" for t in chunk_texts]
+
+        # O pool processa o bloco atual em paralelo usando todas as threads
+        chunk_embeddings = model_emb.encode_multi_process(
+            truncated_texts,
+            pool=pool,
+            batch_size=512,
+        )
+        all_embeddings.append(chunk_embeddings)
+
+    # Desliga o pool imediatamente após o processamento
+    model_emb.stop_multi_process_pool(pool)
+
+    print("📦 Consolidando e normalizando os embeddings criados...")
+    # Junta todos os blocos em uma única matriz numpy gigante
+    text_embeddings = np.vstack(all_embeddings).astype("float32")
+
+    norms = np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    text_embeddings_normalized = text_embeddings / norms
+
+    # 4. SALVANDO NO BANCO VETORIAL FAISS
+    print("📦 Construindo índice do banco vetorial FAISS...")
+    dimension = text_embeddings_normalized.shape[1]  # 384
+    index = faiss.IndexFlatIP(dimension)
+    index.add(text_embeddings_normalized)
+
+    os.makedirs(os.path.dirname(FAISS_PATH), exist_ok=True)
+    faiss.write_index(index, FAISS_PATH)
+    print(f"💾 Banco Vetorial FAISS salvo com sucesso em: {FAISS_PATH}")
+
+    print("⚖️ Calculando matrizes de similaridade de cosseno...")
+    similarity_matrix = np.dot(text_embeddings_normalized, label_embeddings.T)
+    similarity_matrix = np.clip(similarity_matrix, 0, None)
+
+    # Injeta os aspectos calculados E os embeddings puros em formato de lista
+    df_calculo = df_calculo.with_columns(
+        [
+            pl.Series(
+                "aspect_plot", similarity_matrix[:, 0].tolist(), dtype=pl.Float64
+            ),
+            pl.Series(
+                "aspect_style", similarity_matrix[:, 1].tolist(), dtype=pl.Float64
+            ),
+            pl.Series(
+                "aspect_pacing", similarity_matrix[:, 2].tolist(), dtype=pl.Float64
+            ),
+            pl.Series(
+                "text_embedding",
+                text_embeddings_normalized.tolist(),
+                dtype=pl.List(pl.Float32),
+            ),
+        ]
+    )
+
+    print("🎭 Calculando análise de sentimento com VADER...")
+    df_calculo = df_calculo.with_columns(
+        pl.col("clean_summary")
+        .map_elements(classify_sentiment, return_dtype=pl.String)
+        .alias("sentiment_text")
+    )
+
+    # Seleciona as colunas de feature incluindo o vetor para o merge final
+    df_features_todas = df_calculo.select(
+        [
+            "Id",
+            "User_id",
+            "review_length",
+            "unique_words",
+            "aspect_plot",
+            "aspect_style",
+            "aspect_pacing",
+            "sentiment_text",
+            "text_embedding",
+        ]
+    )
+
+    print("\n🔄 Reconstituindo base de dados original via Left Join final...")
+    df_original_completo = lf_original.collect()
+
+    if "score" in df_original_completo.columns:
+        df_original_completo = df_original_completo.with_columns(
+            pl.col("score")
+            .map_elements(map_score, return_dtype=pl.String)
+            .alias("sentiment_score")
         )
 
-        # 2. Sentimento do resumo (VADER)
-        df = df.with_columns(
-            pl.col("clean_summary")
-            .map_elements(classify_sentiment, return_dtype=pl.String)
-            .alias("sentiment_text")
-        )
+    df_final = df_original_completo.join(
+        df_features_todas, on=["Id", "User_id"], how="left"
+    )
 
-        if "score" in df.columns:
-            df = df.with_columns(
-                pl.col("score")
-                .map_elements(map_score, return_dtype=pl.String)
-                .alias("sentiment_score")
-            )
+    df_final = df_final.with_columns(
+        [
+            pl.col("review_length").fill_null(0),
+            pl.col("unique_words").fill_null(0),
+            pl.col("aspect_plot").fill_null(0.0),
+            pl.col("aspect_style").fill_null(0.0),
+            pl.col("aspect_pacing").fill_null(0.0),
+            pl.col("sentiment_text").fill_null("neutro"),
+            pl.col("text_embedding").fill_null(pl.lit(None, dtype=pl.List(pl.Float32))),
+        ]
+    )
 
-        # 3. EXTRAÇÃO SEMÂNTICA DE ASPECTOS (Zero-Shot Batching Otimizado)
-        # Cortamos os reviews longos em 300 caracteres para evitar gargalo e perda de performance
-        texts_to_classify = df["text"].str.slice(0, 300).to_list()
-
-        aspect_plots, aspect_styles, aspect_pacings = extract_zero_shot_aspects(
-            texts_to_classify
-        )
-
-        # Injeta as pontuações probabilísticas geradas pelo modelo de volta no DataFrame
-        df = df.with_columns(
-            [
-                pl.Series("aspect_plot", aspect_plots, dtype=pl.Float64),
-                pl.Series("aspect_style", aspect_styles, dtype=pl.Float64),
-                pl.Series("aspect_pacing", aspect_pacings, dtype=pl.Float64),
-            ]
-        )
-
-        results.append(df)
-
-    print("\nConcatenando resultados finais...")
-    df_final = pl.concat(results)
-
-    print(f"Salvando dataset enriquecido em: {OUTPUT_PATH}")
+    print(
+        f"Saving dataset unificado final ({df_final.height} linhas) em: {OUTPUT_PATH}"
+    )
     df_final.write_parquet(OUTPUT_PATH)
-    print("✅ Finalizado com sucesso!")
+    print("✅ Pipeline executado com sucesso e arquivos locais salvos!")
 
-
-# =========================
-# EXEC
-# =========================
 
 if __name__ == "__main__":
     process_file()

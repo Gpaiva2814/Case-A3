@@ -39,14 +39,47 @@ def normalize_list_column(x):
     return None
 
 
-def clean_authors(text):
-    text = unidecode(str(text)).lower()
-    text = re.sub(r"\bby\b\s*|written by\s*", "", text)
-    text = re.sub(r"\[.*?\]", "", text)
-    text = re.sub(r".*?\((.*?)\)", r"\1", text)
-    text = re.sub(r"[^a-z\s\-]", "", text)
-    tokens = text.split()
-    return " ".join(tokens)
+def normalize_author(name):
+    if name is None:
+        return None
+
+    name = unidecode(str(name)).lower().strip()
+
+    # remove prefixos
+    name = re.sub(r"\bby\b\s*", "", name)
+    name = re.sub(r"\bwritten by\b\s*", "", name)
+
+    # remove conteúdo entre colchetes/parênteses
+    name = re.sub(r"\[.*?\]", "", name)
+    name = re.sub(r"\(.*?\)", "", name)
+
+    # mantém letras, espaço e hífen
+    name = re.sub(r"[^a-z\s\-]", "", name)
+
+    # normaliza hífen
+    name = name.replace("-", " ")
+
+    # remove espaços duplicados
+    name = " ".join(name.split())
+
+    # junta iniciais:
+    # j r r tolkien -> jrr tolkien
+    parts = name.split()
+
+    if len(parts) > 1:
+        initials = []
+        others = []
+
+        for p in parts:
+            if len(p) == 1:
+                initials.append(p)
+            else:
+                others.append(p)
+
+        if initials:
+            name = "".join(initials) + " " + " ".join(others)
+
+    return name.strip()
 
 
 if __name__ == "__main__":
@@ -65,19 +98,19 @@ if __name__ == "__main__":
             pl.col("summary")
             .map_elements(clean_text, return_dtype=pl.String)
             .alias("clean_summary"),
-            pl.col("categories").map_elements(
-                normalize_list_column, return_dtype=pl.List(pl.String)
-            ),
-            pl.col("authors").map_elements(
-                normalize_list_column, return_dtype=pl.List(pl.String)
-            ),
+            pl.col("categories")
+            .map_elements(normalize_list_column, return_dtype=pl.List(pl.String))
+            .alias("clean_categories"),
+            pl.col("authors")
+            .map_elements(normalize_list_column, return_dtype=pl.List(pl.String))
+            .alias("clean_authors"),
         ]
     )
 
     df = df.with_columns(
-        pl.col("authors")
-        .list.eval(pl.element().map_elements(clean_authors, return_dtype=pl.String))
-        .alias("clean_authors")
+        pl.col("clean_authors").list.eval(
+            pl.element().map_elements(normalize_author, return_dtype=pl.String)
+        )
     )
 
     colunas_comuns = [
@@ -101,8 +134,7 @@ if __name__ == "__main__":
     df = df.with_columns(pl.col(colunas_comuns).fill_null("Unknown"))
     df = df.with_columns(
         [
-            pl.col("categories").fill_null(pl.lit(["unknown"])),
-            # pl.col("authors").fill_null(pl.lit(["unknown"])),
+            pl.col("clean_categories").fill_null(pl.lit(["unknown"])),
             pl.col("clean_authors").fill_null(pl.lit(["unknown"])),
         ]
     )
